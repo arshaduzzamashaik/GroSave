@@ -1,0 +1,526 @@
+// Prisma Schema for GroSave (Buildathon-Ready)
+// Covers: Auth & Security, Data Persistence, Orders lifecycle, Dynamic Pricing hooks,
+// Pickup Slot capacity, Wallet & Transactions, Earn events, Notifications, Impact metrics,
+// AI event logs, Documents & Verification, Settings & Sessions
+
+// -------------------------------------------------------
+// Generator & Datasource
+// -------------------------------------------------------
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// -------------------------------------------------------
+// Enums
+// -------------------------------------------------------
+
+enum IncomeRange {
+  BELOW_1_5_LPA
+  BETWEEN_1_5_2_5_LPA
+  BETWEEN_2_5_3_5_LPA
+  ABOVE_3_5_LPA
+}
+
+enum ApplicationStatus {
+  PENDING
+  UNDER_REVIEW
+  APPROVED
+  DENIED
+}
+
+enum OrderStatus {
+  confirmed
+  ready
+  completed
+  cancelled
+}
+
+enum OrderEventType {
+  reserved
+  ready
+  completed
+  cancelled
+  refunded
+  scanned
+}
+
+enum TransactionType {
+  debit
+  credit
+  refund
+  bonus
+}
+
+enum NotificationType {
+  system
+  order
+  wallet
+  promotion
+}
+
+enum EarnType {
+  ad
+  survey
+  referral
+  special
+}
+
+enum DocumentType {
+  INCOME_PROOF
+  ADDRESS_PROOF
+  OTHER
+}
+
+enum SlotId {
+  morning
+  afternoon
+  evening
+}
+
+// -------------------------------------------------------
+// Core User & Security
+// -------------------------------------------------------
+
+model User {
+  id                  String       @id @default(uuid())
+  phone               String       @unique
+  name                String?
+  aadhaarLast4        String?
+  incomeRange         IncomeRange?
+  schoolGoingChildren Int          @default(0)
+  address             String?
+  city                String?
+  pincode             String?
+  isVerified          Boolean      @default(false)
+  eligibilityStatus   String       @default("pending") // kept for compatibility with existing code
+
+  // Preferences & referrals
+  language          String? // e.g., "en"
+  notificationPrefs Json?
+  referralCode      String? @unique
+  invitedById       String?
+
+  // System
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  wallets           Wallet[]
+  orders            Order[]
+  transactions      Transaction[]
+  notifications     Notification[]
+  sessions          Session[]
+  documents         Document[]
+  earnEvents        EarnEvent[]
+  applications      HouseholdApplication[]
+  aiEvents          AIEvent[]
+  pushSubscriptions PushSubscription[]
+  impactStats       ImpactStat[]
+
+  invitedBy    User?         @relation("UserInvites", fields: [invitedById], references: [id])
+  invites      User[]        @relation("UserInvites")
+  OrderEvent   OrderEvent[]
+  UserSettings UserSettings?
+  AuditLog     AuditLog[]
+
+  @@map("users")
+}
+
+model Session {
+  id           String    @id @default(uuid())
+  userId       String
+  refreshToken String    @unique
+  userAgent    String?
+  ip           String?
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  createdAt    DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model OTPAttempt {
+  id        String   @id @default(uuid())
+  phone     String
+  codeHash  String? // optional if hashing OTPs; otherwise omit
+  attempts  Int      @default(0)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([phone])
+}
+
+// -------------------------------------------------------
+// Verification & Documents
+// -------------------------------------------------------
+
+model HouseholdApplication {
+  id     String            @id @default(uuid())
+  userId String
+  status ApplicationStatus @default(PENDING)
+
+  // Snapshotted details at time of application (User also stores canonical values)
+  aadhaarLast4        String?
+  incomeRange         IncomeRange?
+  schoolGoingChildren Int          @default(0)
+  address             String?
+  city                String?
+  pincode             String?
+
+  reviewedBy      String?
+  reviewedAt      DateTime?
+  rejectionReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  documents Document[]
+}
+
+model Document {
+  id            String       @id @default(uuid())
+  userId        String
+  applicationId String?
+  type          DocumentType
+  url           String
+  provider      String? // e.g., "local", "s3"
+  mimeType      String?
+  sizeBytes     Int?
+  checksum      String?
+  uploadedAt    DateTime     @default(now())
+
+  user        User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  application HouseholdApplication? @relation(fields: [applicationId], references: [id], onDelete: SetNull)
+}
+
+// -------------------------------------------------------
+// Catalog & Pricing
+// -------------------------------------------------------
+
+model Product {
+  id             String   @id @default(uuid())
+  name           String
+  brand          String
+  category       String
+  description    String?
+  image          String
+  images         Json? // JSON array of image URLs
+  currentPrice   Int
+  originalPrice  Int
+  discount       Int
+  expiryStatus   String
+  expiryDate     DateTime
+  unitsAvailable Int
+
+  nutritionInfo Json? // JSON object
+  storageInfo   Json? // JSON array
+  safetyInfo    Json? // JSON array
+
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Dynamic Pricing hooks (optional usage)
+  dynamicPricingEnabled          Boolean @default(false)
+  dropToPriceAtHoursBeforeExpiry Int?
+  freeAtHoursBeforeExpiry        Int?
+
+  orders       Order[]
+  priceChanges ProductPriceChange[]
+
+  @@index([category])
+  @@index([expiryDate])
+  @@map("products")
+}
+
+model ProductPriceChange {
+  id            String    @id @default(uuid())
+  productId     String
+  previousPrice Int
+  newPrice      Int
+  reason        String?
+  scheduledAt   DateTime?
+  effectiveAt   DateTime  @default(now())
+  createdAt     DateTime  @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId, effectiveAt])
+}
+
+// Optional global pricing policy (if you want a single place to read defaults)
+model PricingPolicy {
+  id                             String   @id @default(uuid())
+  dropToPriceAtHoursBeforeExpiry Int      @default(24)
+  freeAtHoursBeforeExpiry        Int      @default(6)
+  updatedAt                      DateTime @updatedAt
+  createdAt                      DateTime @default(now())
+}
+
+// -------------------------------------------------------
+// Pickup Locations & Slot Capacity
+// -------------------------------------------------------
+
+model PickupLocation {
+  id        String   @id @default(uuid())
+  name      String
+  address   String
+  city      String
+  pincode   String
+  latitude  Float
+  longitude Float
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Deprecated in favor of PickupSlot rows, but kept for compatibility if needed
+  timeSlots Json? // JSON array [{id,label,time,available}]
+
+  orders Order[]
+  slots  PickupSlot[]
+
+  @@index([city])
+  @@index([pincode])
+  @@map("pickup_locations")
+}
+
+model PickupSlot {
+  id               String    @id @default(uuid())
+  pickupLocationId String
+  date             DateTime // calendar date (midnight local)
+  slot             SlotId
+  label            String // e.g., "Morning"
+  startTime        DateTime?
+  endTime          DateTime?
+  capacity         Int       @default(0)
+  reservedCount    Int       @default(0)
+
+  pickupLocation PickupLocation @relation(fields: [pickupLocationId], references: [id], onDelete: Cascade)
+  orders         Order[]
+
+  @@unique([pickupLocationId, date, slot])
+  @@index([pickupLocationId, date])
+}
+
+// -------------------------------------------------------
+// Orders & Lifecycle
+// -------------------------------------------------------
+
+model Order {
+  id          String      @id @default(uuid())
+  orderNumber String      @unique
+  userId      String
+  productId   String
+  quantity    Int
+  coinsSpent  Int
+  status      OrderStatus @default(confirmed)
+
+  pickupLocationId String
+  pickupTimeSlot   String // kept for compatibility (e.g., "Morning: 8 AM - 12 PM")
+  pickupDate       DateTime
+  pickupSlotId     String? // optional link to capacity-managed slot
+
+  verificationCode String    @unique
+  reservedAt       DateTime  @default(now())
+  completedAt      DateTime?
+  cancelledAt      DateTime?
+  scannedAt        DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user           User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  product        Product        @relation(fields: [productId], references: [id])
+  pickupLocation PickupLocation @relation(fields: [pickupLocationId], references: [id])
+  pickupSlot     PickupSlot?    @relation(fields: [pickupSlotId], references: [id])
+
+  events       OrderEvent[]
+  transactions Transaction[]
+  Notification Notification[]
+
+  @@index([userId, status])
+  @@index([pickupLocationId, pickupDate])
+  @@map("orders")
+}
+
+model OrderEvent {
+  id       String         @id @default(uuid())
+  orderId  String
+  type     OrderEventType
+  at       DateTime       @default(now())
+  byUserId String?
+  meta     Json?
+
+  order  Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  byUser User? @relation(fields: [byUserId], references: [id])
+
+  @@index([orderId, at])
+}
+
+// -------------------------------------------------------
+// Wallet, Transactions, Earn Events
+// -------------------------------------------------------
+
+model Wallet {
+  id             String @id @default(uuid())
+  userId         String
+  currentBalance Int    @default(4000)
+  monthlyCredit  Int    @default(4000)
+  spent          Int    @default(0)
+  bonusEarned    Int    @default(0)
+
+  lastRefillAt DateTime?
+  refillDate   DateTime // next refill date (compat field)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("wallets")
+}
+
+model Transaction {
+  id             String          @id @default(uuid())
+  userId         String
+  type           TransactionType
+  amount         Int
+  description    String
+  relatedOrderId String?
+  balanceAfter   Int
+  createdAt      DateTime        @default(now())
+
+  user         User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  relatedOrder Order? @relation(fields: [relatedOrderId], references: [id])
+
+  @@index([userId, createdAt])
+  @@map("transactions")
+}
+
+model EarnEvent {
+  id        String   @id @default(uuid())
+  userId    String
+  type      EarnType
+  amount    Int      @default(0)
+  sourceId  String? // ad id / survey id / referral code
+  meta      Json?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type, createdAt])
+}
+
+// -------------------------------------------------------
+// Notifications & Settings
+// -------------------------------------------------------
+
+model Notification {
+  id        String           @id @default(uuid())
+  userId    String
+  type      NotificationType
+  title     String
+  message   String
+  isRead    Boolean          @default(false)
+  actionUrl String?
+  data      Json?
+  orderId   String?
+  createdAt DateTime         @default(now())
+
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  order Order? @relation(fields: [orderId], references: [id])
+
+  @@index([userId, isRead, createdAt])
+  @@map("notifications")
+}
+
+model PushSubscription {
+  id        String   @id @default(uuid())
+  userId    String
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model UserSettings {
+  id              String   @id @default(uuid())
+  userId          String   @unique
+  language        String? // e.g., "en"
+  notificationsOn Boolean  @default(true)
+  preferredHubs   Json? // array of pickupLocationIds
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// -------------------------------------------------------
+// Impact Metrics & AI Event Logs
+// -------------------------------------------------------
+
+model ImpactStat {
+  id          String   @id @default(uuid())
+  userId      String
+  month       DateTime // normalized to first day of month
+  kgRescued   Float    @default(0)
+  co2SavedKg  Float    @default(0)
+  rupeesSaved Int      @default(0)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, month])
+}
+
+model AIEvent {
+  id        String   @id @default(uuid())
+  userId    String?
+  type      String // e.g., "recommendation", "anomaly", "pricing_suggest"
+  model     String? // e.g., "gpt-4.1", "custom-v1"
+  input     Json?
+  output    Json?
+  score     Float?
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([userId, type, createdAt])
+}
+
+// -------------------------------------------------------
+// Audit & Feature Flags (optional but useful)
+// -------------------------------------------------------
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  userId    String?
+  action    String
+  entity    String? // e.g., "Order", "Product"
+  entityId  String?
+  diff      Json?
+  ip        String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([action, createdAt])
+}
+
+model FeatureFlag {
+  id        String   @id @default(uuid())
+  key       String   @unique
+  enabled   Boolean  @default(false)
+  payload   Json?
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+}
